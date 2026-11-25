@@ -1,0 +1,264 @@
+mkdir -p neuro-escape && cat > neuro-escape/index.html << 'EOF'
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>НЕЙРО-ПОБЕГ — Каленкавичи</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#05050a;color:#e8e8f0;font-family:system-ui,sans-serif;overflow:hidden;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;user-select:none}
+  #top{position:fixed;top:0;left:0;right:0;padding:12px 22px;display:flex;justify-content:space-between;align-items:center;font-weight:800;font-size:.95rem;z-index:10;pointer-events:none;background:linear-gradient(180deg,rgba(5,5,10,.9),transparent)}
+  #top .stat{display:flex;gap:18px}
+  #top b{color:#00e5ff}
+  #brain{position:fixed;bottom:14px;left:0;right:0;text-align:center;font-size:.8rem;color:#5a5a75;z-index:10;pointer-events:none;letter-spacing:1px}
+  #brain span{color:#b06aff;font-weight:700}
+  canvas{display:block;border-radius:18px;box-shadow:0 0 80px rgba(0,229,255,.15),0 0 160px rgba(176,106,255,.1)}
+  #ov{position:fixed;inset:0;background:rgba(5,5,10,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:20;backdrop-filter:blur(10px);text-align:center;padding:20px}
+  #ov h1{font-size:clamp(1.7rem,5vw,2.8rem);background:linear-gradient(90deg,#00e5ff,#b06aff,#ff2e88);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:2px;margin-bottom:8px}
+  #ov p{color:#8a8aa5;max-width:460px;margin-bottom:8px;font-size:.95rem;line-height:1.5}
+  #ov .tag{color:#00e5ff;font-size:.8rem;letter-spacing:2px;margin-bottom:18px}
+  #ov button{margin-top:18px;padding:15px 42px;border:none;border-radius:50px;background:linear-gradient(135deg,#00e5ff,#b06aff);color:#05050a;font-size:1.1rem;font-weight:900;cursor:pointer;transition:transform .15s,box-shadow .2s;box-shadow:0 0 40px rgba(0,229,255,.4)}
+  #ov button:hover{transform:scale(1.06);box-shadow:0 0 60px rgba(0,229,255,.7)}
+  #ov.hidden{display:none}
+  .hint{margin-top:16px;font-size:.78rem;color:#44445a}
+  kbd{background:#15152a;padding:2px 7px;border-radius:5px;border:1px solid #25253f;font-size:.72rem}
+</style>
+</head>
+<body>
+<div id="top">
+  <div class="stat"><span>💎 <b id="score">0</b></span><span>🏆 <b id="best">0</b></span></div>
+  <div class="stat"><span>🧠 <b id="iq">0</b></span></div>
+</div>
+<div id="brain">ИИ изучает тебя... <span id="profile">наблюдает</span></div>
+<canvas id="c" width="820" height="480"></canvas>
+<div id="ov">
+  <div class="tag">АДАПТИВНЫЙ ИИ-ПРОТИВНИК</div>
+  <h1>НЕЙРО-ПОБЕГ</h1>
+  <p>Ты сбежал из лаборатории. Но лаборатория сбежала вместе с тобой. Она <b>изучает твой стиль</b> в реальном времени и подстраивает ловушки под твои слабости.</p>
+  <p style="color:#b06aff"><b>Прыгаешь много?</b> — будут низкие потолки. <b>Жмёшься к земле?</b> — высокие лазеры. <b>Бежишь по центру?</b> — дроны с двух сторон.</p>
+  <button id="startBtn">🧠 ЗАПУСТИТЬ ПОБЕГ</button>
+  <div class="hint"><kbd>Space</kbd>/<kbd>↑</kbd> — прыжок &nbsp;·&nbsp; <kbd>↓</kbd> — присесть &nbsp;·&nbsp; тап: верх/низ</div>
+</div>
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const W=cv.width,H=cv.height,GROUND=H-64;
+const scoreEl=document.getElementById('score'),bestEl=document.getElementById('best'),iqEl=document.getElementById('iq');
+const profileEl=document.getElementById('profile'),ov=document.getElementById('ov'),startBtn=document.getElementById('startBtn');
+
+let actx;
+function beep(f,d,t='sine',v=.05){if(!actx)actx=new(window.AudioContext||window.webkitAudioContext)();const o=actx.createOscillator(),g=actx.createGain();o.type=t;o.frequency.value=f;g.gain.setValueAtTime(v,actx.currentTime);g.gain.exponentialRampToValueAtTime(.001,actx.currentTime+d);o.connect(g);g.connect(actx.destination);o.start();o.stop(actx.currentTime+d)}
+
+// ===== ПРОФИЛЬ ИГРОКА (ИИ-модель) =====
+// ИИ ведёт статистику твоего стиля и меняет спавн
+const brain = {
+  jumps: 0, ducks: 0, runTime: 0, // сколько времени бежал без действий
+  lastAction: 0,
+  // черты: 0..1, обновляются в реальном времени
+  jumpiness: 0.5,  // насколько часто прыгаешь
+  crouchiness: 0.5, // насколько часто приседаешь
+  passivity: 0.5,   // насколько пассивно бежишь
+  reset(){ this.jumps=this.ducks=this.runTime=0; this.lastAction=0; this.jumpiness=this.crouchiness=this.passivity=0.5; },
+  // ИИ решает, что заспавнить
+  pickObstacle(){
+    // Если игрок много прыгает → спавним низкие потолки (надо приседать)
+    // Если много приседает → высокие лазеры (надо прыгать)
+    // Если пассивен → дроны с двух сторон
+    const r = Math.random();
+    if (this.jumpiness > 0.65 && r < 0.5) return 'ceiling';
+    if (this.crouchiness > 0.65 && r < 0.5) return 'highLaser';
+    if (this.passivity > 0.65 && r < 0.4) return 'twinDrone';
+    if (r < 0.35) return 'drone';
+    if (r < 0.65) return 'laser';
+    return 'ceiling';
+  },
+  // получаем фидбэк от действий
+  onJump(){ this.jumps++; this.lastAction=0; this.jumpiness=Math.min(1,this.jumpiness+0.08); this.crouchiness=Math.max(0,this.crouchiness-0.02); this.passivity=Math.max(0,this.passivity-0.04); },
+  onDuck(){ this.ducks++; this.lastAction=0; this.crouchiness=Math.min(1,this.crouchiness+0.08); this.jumpiness=Math.max(0,this.jumpiness-0.02); this.passivity=Math.max(0,this.passivity-0.04); },
+  tick(dt){ this.lastAction+=dt; this.runTime+=dt;
+    // если долго без действий — растёт пассивность
+    if (this.lastAction > 1.2) this.passivity=Math.min(1,this.passivity+0.01);
+    // медленный дрейф к 0.5 (забываем старое)
+    ['jumpiness','crouchiness','passivity'].forEach(k=>{ this[k] += (0.5 - this[k])*0.0008; });
+  },
+  profileName(){
+    if (this.jumpiness>0.7) return 'ПРЫГУН 🐰';
+    if (this.crouchiness>0.7) return 'ПЛАСТУН 🐍';
+    if (this.passivity>0.7) return 'ТИХОНЯ 🐢';
+    return 'ХАОТИК 🎲';
+  }
+};
+
+// ===== СОСТОЯНИЕ =====
+let state='menu',score=0,best=+(localStorage.getItem('kk_best2')||0),speed,frame;
+let player,obstacles,coins,particles,echoTrail,ghost;
+bestEl.textContent=best;
+
+function reset(){
+  score=0;speed=6;frame=0;obstacles=[];coins=[];particles=[];echoTrail=[];ghost=null;
+  brain.reset();
+  player={x:110,y:GROUND-52,w:38,h:52,vy:0,onGround:true,ducking:false,duckT:0};
+  scoreEl.textContent='0';iqEl.textContent='0';
+  profileEl.textContent='наблюдает';
+  // Загружаем призрак прошлого забега (эхо)
+  const saved=localStorage.getItem('kk_echo');
+  if(saved){ try{ghost=JSON.parse(saved);}catch(e){ghost=null;} }
+}
+function recordEcho(){
+  // сохраняем траекторию прыжков для эха
+  const trail=echoTrail.slice(-180).map(p=>({x:Math.round(p.x),y:Math.round(p.y)}));
+  if(trail.length>8) localStorage.setItem('kk_echo',JSON.stringify(trail));
+}
+
+// ===== ВВОД =====
+function jump(){ if(state!=='play')return; if(player.onGround){player.vy=-13.5;player.onGround=false;brain.onJump();beep(620,0.1,'square',.05);burst(player.x+player.w/2,player.y+player.h,'#00e5ff',7);} }
+function duckOn(){ if(state!=='play')return; player.ducking=true; player.duckT=0.34; brain.onDuck(); }
+function duckOff(){ player.ducking=false; }
+addEventListener('keydown',e=>{ if(e.code==='Space'||e.code==='ArrowUp'){e.preventDefault();jump();} if(e.code==='ArrowDown'){e.preventDefault();duckOn();} });
+addEventListener('keyup',e=>{ if(e.code==='ArrowDown')duckOff(); });
+cv.addEventListener('pointerdown',e=>{ if(state!=='play')return; const r=cv.getBoundingClientRect(); const my=(e.clientY-r.top)*(H/r.height); if(my>H*0.6)duckOn(); else jump(); });
+cv.addEventListener('pointerup',duckOff);
+
+// ===== СПАВН =====
+function spawn(){ const t=brain.pickObstacle();
+  if(t==='drone') obstacles.push({x:W+40,y:GROUND-95,w:44,h:44,type:'drone',rot:0});
+  else if(t==='laser') obstacles.push({x:W+40,y:GROUND-26,w:30,h:26,type:'laser'});
+  else if(t==='ceiling') obstacles.push({x:W+40,y:GROUND-140,w:40,h:90,type:'ceiling'}); // надо присесть
+  else if(t==='highLaser') obstacles.push({x:W+40,y:GROUND-125,w:30,h:110,type:'laser'}); // надо прыгать/под
+  else if(t==='twinDrone'){ obstacles.push({x:W+40,y:GROUND-95,w:40,h:40,type:'drone',rot:0}); obstacles.push({x:W+120,y:GROUND-95,w:40,h:40,type:'drone',rot:1.5}); }
+}
+function spawnCoin(){ coins.push({x:W+30,y:GROUND-60-Math.random()*130,r:13,ph:Math.random()*6.28}); }
+function burst(x,y,c,n=10){ for(let i=0;i<n;i++)particles.push({x,y,vx:(Math.random()-.5)*8,vy:(Math.random()-.5)*8-2,life:1,c,s:2+Math.random()*3}); }
+
+// ===== ОБНОВЛЕНИЕ =====
+function update(dt){
+  frame++; speed+=0.0013;
+  brain.tick(dt);
+  if(frame%Math.max(32,80-Math.floor(speed*4))===0) spawn();
+  if(frame%64===0) spawnCoin();
+
+  // физика
+  player.vy+=0.78; player.y+=player.vy;
+  if(player.y>=GROUND-player.h){player.y=GROUND-player.h;player.vy=0;player.onGround=true;}
+  const th=player.ducking?26:52; player.h+=(th-player.h)*0.3;
+  if(player.duckT>0){player.duckT-=dt;if(player.duckT<=0)player.ducking=false;}
+
+  // эхо (запись)
+  if(frame%2===0) echoTrail.push({x:player.x,y:player.y});
+
+  // препятствия
+  for(let i=obstacles.length-1;i>=0;i--){ const o=obstacles[i]; o.x-=speed;
+    if(o.type==='drone')o.rot+=0.13;
+    if(o.x+o.w<-30){obstacles.splice(i,1);continue;}
+    if(player.x<o.x+o.w&&player.x+player.w>o.x&&player.y<o.y+o.h&&player.y+player.h>o.y){ gameOver(); return; }
+  }
+  // монеты
+  for(let i=coins.length-1;i>=0;i--){ const c=coins[i]; c.x-=speed; c.ph+=0.15;
+    if(c.x+c.r<-20){coins.splice(i,1);continue;}
+    const cx=c.x,cy=c.y+Math.sin(c.ph)*4,px=player.x+player.w/2,py=player.y+player.h/2;
+    if(Math.hypot(cx-px,cy-py)<c.r+player.w/2){ score+=10;scoreEl.textContent=score;burst(cx,cy,'#ffd60a',12);beep(880+Math.random()*200,.08,'sine',.06);coins.splice(i,1); }
+  }
+  // частицы
+  for(let i=particles.length-1;i>=0;i--){ const p=particles[i]; p.x+=p.vx;p.y+=p.vy;p.vy+=0.35;p.life-=0.02; if(p.life<=0)particles.splice(i,1); }
+  // IQ = сложность
+  const iq=Math.round(60+speed*7+brain.jumpiness*100+brain.crouchiness*100);
+  iqEl.textContent=iq;
+  profileEl.textContent=brain.profileName();
+}
+
+// ===== РИСОВАНИЕ =====
+function draw(){
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#05050a');g.addColorStop(.7,'#0a0a1f');g.addColorStop(1,'#120a24');
+  ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+
+  // сетка перспективы
+  ctx.strokeStyle='rgba(0,229,255,0.06)';ctx.lineWidth=1;
+  for(let i=0;i<12;i++){ const x=(i*W/12 + (frame*speed*0.4)%(W/12)); ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke(); }
+  for(let i=0;i<6;i++){ const y=GROUND-i*20; ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke(); }
+
+  // земля
+  ctx.fillStyle='#03030a';ctx.fillRect(0,GROUND,W,H-GROUND);
+  ctx.strokeStyle='#00e5ff';ctx.lineWidth=2;ctx.shadowColor='#00e5ff';ctx.shadowBlur=18;
+  ctx.beginPath();ctx.moveTo(0,GROUND);ctx.lineTo(W,GROUND);ctx.stroke();ctx.shadowBlur=0;
+
+  // эхо (призрак прошлого)
+  if(ghost&&ghost.length>2){
+    ctx.globalAlpha=0.18;ctx.fillStyle='#b06aff';
+    for(let i=0;i<ghost.length;i+=6){ const p=ghost[i]; const x=(p.x + W - (frame*speed*0.4)%W)%W; ctx.fillRect(x,GROUND-p.y,14,14); }
+    ctx.globalAlpha=1;
+  }
+
+  // монеты
+  coins.forEach(c=>{ const cy=c.y+Math.sin(c.ph)*4; ctx.save();ctx.translate(c.x,cy);ctx.rotate(c.ph*.5);
+    ctx.shadowColor='#ffd60a';ctx.shadowBlur=16;ctx.fillStyle='#ffd60a';
+    ctx.beginPath();ctx.moveTo(0,-c.r);ctx.lineTo(c.r,0);ctx.lineTo(0,c.r);ctx.lineTo(-c.r,0);ctx.closePath();ctx.fill();
+    ctx.shadowBlur=0;ctx.fillStyle='#fff7c2';ctx.beginPath();ctx.arc(0,0,4,0,6.28);ctx.fill();ctx.restore(); });
+
+  // препятствия
+  obstacles.forEach(o=>{ ctx.save();ctx.translate(o.x+o.w/2,o.y+o.h/2);
+    if(o.type==='drone'){ ctx.rotate(o.rot);ctx.shadowColor='#ff2e88';ctx.shadowBlur=20;ctx.fillStyle='#ff2e88';
+      ctx.beginPath();ctx.arc(0,0,o.w/2,0,6.28);ctx.fill();ctx.shadowBlur=0;
+      ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(0,0,5,0,6.28);ctx.fill();
+      ctx.strokeStyle='#ff2e88';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(-o.w/2,0);ctx.lineTo(o.w/2,0);ctx.moveTo(0,-o.w/2);ctx.lineTo(0,o.w/2);ctx.stroke();
+    } else if(o.type==='laser'){ ctx.shadowColor='#00e5ff';ctx.shadowBlur=22;ctx.fillStyle='#00e5ff';ctx.fillRect(-o.w/2,-o.h/2,o.w,o.h);
+      ctx.shadowBlur=0;ctx.fillStyle='#fff';ctx.fillRect(-o.w/4,-o.h/4,o.w/2,o.h/2);
+    } else if(o.type==='ceiling'){ ctx.shadowColor='#b06aff';ctx.shadowBlur=20;ctx.fillStyle='#b06aff';ctx.fillRect(-o.w/2,-o.h/2,o.w,o.h);
+      ctx.shadowBlur=0;ctx.strokeStyle='#e0c0ff';ctx.lineWidth=2;ctx.strokeRect(-o.w/2,-o.h/2,o.w,o.h); }
+    ctx.restore(); });
+
+  // частицы
+  particles.forEach(p=>{ ctx.globalAlpha=Math.max(0,p.life);ctx.fillStyle=p.c;ctx.shadowColor=p.c;ctx.shadowBlur=10;
+    ctx.beginPath();ctx.arc(p.x,p.y,p.s,0,6.28);ctx.fill(); });
+  ctx.globalAlpha=1;ctx.shadowBlur=0;
+
+  // игрок
+  const px=player.x,py=player.y,pw=player.w,ph=player.h;
+  ctx.save();ctx.shadowColor='#00e5ff';ctx.shadowBlur=22;
+  const bg=ctx.createLinearGradient(px,py,px,py+ph);
+  bg.addColorStop(0,'#00e5ff');bg.addColorStop(1,'#b06aff');
+  ctx.fillStyle=bg;ctx.beginPath();ctx.roundRect(px,py,pw,ph,9);ctx.fill();
+  // антенна
+  ctx.strokeStyle='#ff2e88';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(px+pw/2,py);ctx.lineTo(px+pw/2,py-12);ctx.stroke();
+  ctx.fillStyle='#ff2e88';ctx.beginPath();ctx.arc(px+pw/2,py-14,3,0,6.28);ctx.fill();
+  // глаза
+  ctx.shadowBlur=0;ctx.fillStyle='#05050a';
+  ctx.beginPath();ctx.arc(px+pw*.35,py+ph*.35,4,0,6.28);ctx.arc(px+pw*.65,py+ph*.35,4,0,6.28);ctx.fill();
+  ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(px+pw*.35-1,py+ph*.33,1.5,0,6.28);ctx.arc(px+pw*.65-1,py+ph*.33,1.5,0,6.28);ctx.fill();
+  // рот
+  ctx.strokeStyle='#05050a';ctx.lineWidth=2;ctx.beginPath();
+  if(player.ducking){ctx.moveTo(px+pw*.35,py+ph*.75);ctx.lineTo(px+pw*.65,py+ph*.75);}
+  else{ctx.arc(px+pw/2,py+ph*.65,5,.1,Math.PI-.1);}
+  ctx.stroke();ctx.restore();
+}
+
+// ===== ЦИКЛ =====
+let last=performance.now();
+function loop(now){ const dt=Math.min((now-last)/16.67,3); last=now;
+  if(state==='play'){ update(dt); if(state==='play') draw(); }
+  requestAnimationFrame(loop);
+}
+function gameOver(){ state='over'; if(score>best){best=score;localStorage.setItem('kk_best2',best);} bestEl.textContent=best;
+  recordEcho();
+  burst(player.x+player.w/2,player.y+player.h/2,'#ff2e88',36);
+  beep(180,.3,'sawtooth',.1); setTimeout(()=>beep(120,.4,'sawtooth',.1),110);
+  ov.classList.remove('hidden');
+  ov.innerHTML=`<div class="tag">ИИ ИЗУЧИЛ ТЕБЯ</div>
+    <h1>ПОЙМАН 💥</h1>
+    <p>Твой стиль: <b style="color:#b06aff">${brain.profileName()}</b><br>
+    Прыжков: <b>${brain.jumps}</b> · Приседаний: <b>${brain.ducks}</b> · IQ ИИ: <b>${iqEl.textContent}</b></p>
+    <p>Собрано: <b>${score}</b> 💎 · Рекорд: <b>${best}</b> 💎</p>
+    <p style="color:#00e5ff;font-size:.85rem;margin-top:10px">В следующий раз ИИ будет знать о тебе больше...</p>
+    <button id="retry">🔁 ЕЩЁ РАЗ</button>
+    <div class="hint">Призрак прошлого забега бежит рядом — учись на ошибках</div>`;
+  document.getElementById('retry').addEventListener('click',startGame);
+}
+function startGame(){ reset(); state='play'; ov.classList.add('hidden'); last=performance.now(); }
+startBtn.addEventListener('click',startGame);
+reset(); draw(); requestAnimationFrame(loop);
+</script>
+</body>
+</html>
+  cd neuro-escape && git init && git add . && git commit -m "neuro escape" && git branch -M main && git remote add origin https://github.com/НИК/РЕПО.git && git push -u origin main
+EOF
+cd neuro-escape && python3 -m http.server 8000
